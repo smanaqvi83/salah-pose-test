@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Salah Pose Test</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Amiri&display=swap" rel="stylesheet">
 <style>
   :root { --bg:#0f1412; --fg:#e8efe9; --muted:#8fa197; --accent:#3fbf7f; --warn:#e0a83a; --bad:#e05a4f; --card:#18201c; }
   * { box-sizing:border-box; }
@@ -33,14 +35,19 @@
   .toggle { display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid #2c3832; border-radius:8px; padding:0 14px; min-height:44px; }
   .toggle input { width:20px; height:20px; accent-color:var(--accent); }
   #status { color:var(--muted); font-size:14px; margin-top:6px; min-height:1.4em; }
+  .guide { background:var(--card); border-radius:12px; padding:14px 16px; margin-top:12px; border-left:4px solid var(--accent); }
+  .guide .step { color:var(--muted); font-size:14px; }
+  .guide .ar { font-family:"Amiri", "Noto Naskh Arabic", "Scheherazade New", serif; font-size:clamp(24px, 6vw, 36px); line-height:1.9; direction:rtl; text-align:right; margin:6px 0; }
+  .guide .tr { font-style:italic; }
+  .guide .en { color:var(--muted); font-size:14px; margin-top:4px; }
   .tip { color:var(--muted); font-size:14px; background:var(--card); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Salah pose kill-test · Fiqh Ja'fari · processing stays on this device</h1>
-  <div class="tip"><b>Speak positions</b> is for practice runs (going through the motions), not a real fard prayer.</div>
-  <div class="tip">Place the phone <b>to your side</b>, about <b>2–2.5 m</b> away, around hip height, with your whole body (head to feet) in frame. Landscape works best.</div>
+  <div class="tip"><b>Practice guide</b> and <b>Speak</b> are for practice runs (going through the motions), not a real fard prayer.</div>
+  <div class="tip">Put the phone <b>in front of you or to your side</b>, 2–2.5 m away, around hip height, with your whole body (head to feet) in frame. <b>Stand straight for 2 seconds first</b> so it learns your standing height.</div>
 
   <div class="stage" id="stage">
     <video id="video" playsinline muted></video>
@@ -59,11 +66,23 @@
       <option value="heavy">Model: heavy (most accurate, slow phones lag)</option>
       <option value="lite">Model: lite (fastest, weakest in sajda)</option>
     </select>
-    <label class="toggle"><input type="checkbox" id="speak"> Speak positions</label>
+    <select id="prayer" aria-label="Prayer">
+      <option value="2">Fajr (2 rakats)</option>
+      <option value="4" selected>Zuhr / Asr / Isha (4)</option>
+      <option value="3">Maghrib (3)</option>
+    </select>
+    <label class="toggle"><input type="checkbox" id="guideOn" checked> Practice guide</label>
+    <label class="toggle"><input type="checkbox" id="speak" checked> Speak</label>
     <select id="voice" aria-label="Voice" hidden></select>
     <button id="export" disabled>Export CSV</button>
     <button id="exportFrames" disabled>Export frames</button>
     <button id="clear">Clear log</button>
+  </div>
+  <div class="guide" id="guide" hidden>
+    <div class="step" id="gStep"></div>
+    <div class="ar" id="gAr" lang="ar"></div>
+    <div class="tr" id="gTr"></div>
+    <div class="en" id="gEn"></div>
   </div>
   <div id="status">Tap Start. First load downloads the model (~5–10 MB), then it works offline from cache.</div>
 
@@ -85,7 +104,7 @@
 
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { classify, annotate as annotateSegments, label, dur } from "./classify.js";
+import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js";
 
 const MODELS = {
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -94,7 +113,7 @@ const MODELS = {
 };
 const SMOOTH_FRAMES = 7;      // majority vote window
 const SMOOTH_MIN = 5;         // votes needed to switch stable pose
-const STILL_THRESHOLD = 0.25; // torso-lengths per second; ponytail: hand-picked, tune from exported runs
+const STILL_THRESHOLD = 0.4;  // body-lengths per second; ponytail: hand-picked, tune from exported frames
 const MIN_SEGMENT_MS = 400;   // ignore flicker shorter than this in the log
 const TUMANINAH_MS = 1000;    // stillness needed to count as a calm, settled position
 const KEY_POINTS = [0, 11, 12, 23, 24, 25, 26, 27, 28]; // wrists excluded so qunoot hands do not break stillness
@@ -103,6 +122,7 @@ const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 let landmarker, drawer, stream, facing = "environment", running = false, wakeLock;
 let history = [], stable = null, segments = [], current = null;
+let ref = null; // standing hip height + torso length, learned while standing straight
 let prevPts = null, prevT = 0, motionAvg = 0, fpsAvg = 0, lastDetect = 0;
 
 async function loadModel() {
@@ -153,7 +173,9 @@ $("start").onclick = async () => {
 };
 $("flip").onclick = async () => { facing = facing === "user" ? "environment" : "user"; await startCamera(); };
 $("model").onchange = () => { landmarker?.close(); landmarker = null; if (running) loadModel(); };
-$("clear").onclick = () => { segments = []; current = null; renderLog(); };
+$("clear").onclick = () => { segments = []; current = null; ref = null; lastCoach = { key: null, t: 0 }; renderLog(); renderGuide(); };
+$("guideOn").onchange = () => renderGuide();
+$("prayer").onchange = () => renderGuide();
 $("export").onclick = exportCsv;
 $("exportFrames").onclick = exportFrames;
 
@@ -169,22 +191,31 @@ function loop(now) {
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const lm = res.landmarks?.[0];
-  if (!lm) { update("nobody", null, {}, now); return; }
+  if (!lm) { if (!ref) coach(null, now); update("nobody", null, {}, now); return; }
 
   drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#3fbf7f", lineWidth: 4 });
   drawer.drawLandmarks(lm, { color: "#e8efe9", radius: 3 });
 
-  const { pose, metrics, flags } = classify(lm, video.videoWidth / video.videoHeight);
+  const aspect = video.videoWidth / video.videoHeight;
+  const result = classify(lm, aspect, { world: res.worldLandmarks?.[0], ref });
+  if (!ref) coach(lm, now);
+  const hadRef = !!ref;
+  ref = standingRef(ref, lm, aspect, result);
+  if (!hadRef && ref) { setupMsg = ""; say("Got it, I can see you clearly. You can begin."); }
+  const { pose, metrics, flags } = result;
   trackMotion(lm, now);
   update(pose, metrics, flags, now);
 }
 
 // Average landmark speed, normalized by torso length so distance from camera doesn't matter.
+// Only clearly visible points count: hidden joints jitter and would make every hold look "rushed".
 function trackMotion(lm, now) {
-  const torso = Math.hypot(lm[11].x - lm[23].x, lm[11].y - lm[23].y) || 1;
-  const pts = KEY_POINTS.map((i) => [lm[i].x, lm[i].y]);
+  const torso = ref?.torso || Math.hypot(lm[11].x - lm[23].x, lm[11].y - lm[23].y) || 1;
+  const pts = KEY_POINTS.map((i) => [lm[i].x, lm[i].y, (lm[i].visibility ?? 1) >= 0.5]);
   if (prevPts && now > prevT) {
-    const d = pts.reduce((s, p, i) => s + Math.hypot(p[0] - prevPts[i][0], p[1] - prevPts[i][1]), 0) / pts.length;
+    const moved = pts.map((p, i) => (p[2] && prevPts[i][2] ? Math.hypot(p[0] - prevPts[i][0], p[1] - prevPts[i][1]) : null)).filter((d) => d !== null);
+    if (!moved.length) { prevPts = pts; prevT = now; return; }
+    const d = moved.reduce((a, b) => a + b, 0) / moved.length;
     const speed = d / torso / ((now - prevT) / 1000);
     motionAvg = motionAvg * 0.7 + speed * 0.3;
   }
@@ -220,6 +251,8 @@ function update(pose, metrics, flags, now) {
     : stable === "unknown" ? "Shoulders/hips unclear — better light or plainer background"
     : current && stable !== "transition" ? (still ? "Still " : "Moving ") + ((current.end - current.start) / 1000).toFixed(1) + "s" : "";
   $("still").className = still ? "ok" : "warn";
+  if (!ref) { $("still").textContent = setupMsg; $("still").className = "warn"; }
+  renderGuide();
   $("rakat").textContent = "Rakats: " + segments.filter((s) => s.pose === "ruku" && s.end - s.start >= MIN_SEGMENT_MS).length;
   if (metrics) {
     $("mKnee").textContent = metrics.knee === null ? "hidden" : metrics.knee.toFixed(0) + "°";
@@ -241,7 +274,7 @@ const PHRASES = { qiyam: "Standing", qunoot: "Qunoot", ruku: "Rukoo", sajda: "Sa
   unknown: "I can't see your body clearly", nobody: "I can't see anyone. Please step into the frame." };
 const SPEAK_AFTER_MS = { unknown: 2000, nobody: 2000, qunoot: 0 }; // qunoot label itself only appears after 2s; others: MIN_SEGMENT_MS
 const clips = {};
-for (const pose of Object.keys(PHRASES)) {
+for (const pose of [...Object.keys(PHRASES), "qiyamTasbihat", "qawmah", "betweenSajdas", "istiraha", "tashahhud", "tashahhudSalam"]) {
   const a = new Audio(`audio/${pose}.mp3`);
   a.preload = "auto";
   a.addEventListener("canplaythrough", () => (clips[pose] = a), { once: true });
@@ -276,19 +309,104 @@ $("speak").onchange = () => {
 };
 $("voice").onchange = () => say("This is how I sound.");
 
-function say(text, pose) {
+// Speaks the English instruction, then (optionally) the Arabic text with an Arabic voice.
+// A recorded clip at audio/<key>.mp3 replaces both — the right way to ship recitation.
+function say(text, pose, arabic) {
   if (!$("speak").checked) return;
   const clip = pose && clips[pose];
   if (clip) { clip.currentTime = 0; clip.play().catch(() => {}); return; }
   if (!("speechSynthesis" in window)) return;
   speechSynthesis.cancel(); // drop stale callouts so speech never lags behind the body
+  const voices = speechSynthesis.getVoices();
   const u = new SpeechSynthesisUtterance(text);
-  u.voice = speechSynthesis.getVoices().find((v) => v.name === $("voice").value) ?? null;
+  u.voice = voices.find((v) => v.name === $("voice").value) ?? null;
   u.rate = 0.95; u.pitch = 1.0; u.volume = 1;
   speechSynthesis.speak(u);
+  const arVoice = arabic && voices.filter((v) => /^ar/i.test(v.lang)).sort((a, b) => voiceScore(b) - voiceScore(a))[0];
+  if (arVoice) {
+    const a = new SpeechSynthesisUtterance(arabic);
+    a.voice = arVoice; a.lang = arVoice.lang; a.rate = 0.8;
+    speechSynthesis.speak(a);
+  }
+}
+
+// ---- Practice guide (Fiqh Ja'fari). 🔎 Text to be checked by an alim before anyone else uses this. ----
+const GUIDE = {
+  qiyam: { step: "Qiyam — standing", say: "Stand straight. Recite Surah Al-Fatiha, then one more surah.",
+    ar: "بِسْمِ اللّٰهِ الرَّحْمٰنِ الرَّحِيمِ ۝ اَلْحَمْدُ لِلّٰهِ رَبِّ الْعَالَمِينَ …", tr: "Surah Al-Fatiha, then one full surah (e.g. Al-Ikhlas)", en: "" },
+  qiyamTasbihat: { step: "Qiyam — 3rd/4th rakat", say: "Recite the tasbeehaat, three times.",
+    ar: "سُبْحَانَ اللّٰهِ وَالْحَمْدُ لِلّٰهِ وَلَا إِلٰهَ إِلَّا اللّٰهُ وَاللّٰهُ أَكْبَرُ",
+    tr: "Subhanallahi wal-hamdu lillahi wa la ilaha illallahu wallahu akbar (×3)",
+    en: "Glory be to Allah, praise be to Allah, there is no god but Allah, and Allah is the Greatest." },
+  qunoot: { step: "Qunoot — hands raised", say: "Qunoot. Recite a dua.",
+    ar: "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ",
+    tr: "Rabbana atina fid-dunya hasanatan wa fil-akhirati hasanatan wa qina ‘adhaban-nar",
+    en: "Our Lord, give us good in this world and good in the Hereafter, and protect us from the Fire." },
+  ruku: { step: "Ruku", say: "Ruku. Recite.",
+    ar: "سُبْحَانَ رَبِّيَ الْعَظِيمِ وَبِحَمْدِهِ", tr: "Subhana Rabbiyal ‘Azeemi wa bihamdih",
+    en: "Glory be to my Lord, the Most Great, and praise be to Him." },
+  qawmah: { step: "Qawmah — standing after ruku", say: "Stand up straight.",
+    ar: "سَمِعَ اللّٰهُ لِمَنْ حَمِدَهُ", tr: "Sami‘ Allahu liman hamidah (mustahab)",
+    en: "Allah hears the one who praises Him." },
+  sajda: { step: "Sajda", say: "Sajdah. Recite.",
+    ar: "سُبْحَانَ رَبِّيَ الْأَعْلَى وَبِحَمْدِهِ", tr: "Subhana Rabbiyal A‘la wa bihamdih",
+    en: "Glory be to my Lord, the Most High, and praise be to Him." },
+  betweenSajdas: { step: "Sitting between the two sajdas", say: "Sit up. Recite.",
+    ar: "أَسْتَغْفِرُ اللّٰهَ رَبِّي وَأَتُوبُ إِلَيْهِ", tr: "Astaghfirullaha rabbi wa atubu ilayh (mustahab)",
+    en: "I seek forgiveness from Allah, my Lord, and turn to Him." },
+  istiraha: { step: "Jalsat al-istiraha — sit briefly, then stand", say: "Sit for a moment, then stand up.",
+    ar: "بِحَوْلِ اللّٰهِ وَقُوَّتِهِ أَقُومُ وَأَقْعُدُ", tr: "Bihawlillahi wa quwwatihi aqumu wa aq‘ud (while rising)",
+    en: "By the power and strength of Allah I stand and sit." },
+  tashahhud: { step: "Tashahhud", say: "Tashahhud. Recite.",
+    ar: "أَشْهَدُ أَنْ لَا إِلٰهَ إِلَّا اللّٰهُ وَحْدَهُ لَا شَرِيكَ لَهُ، وَأَشْهَدُ أَنَّ مُحَمَّدًا عَبْدُهُ وَرَسُولُهُ، اللّٰهُمَّ صَلِّ عَلَى مُحَمَّدٍ وَآلِ مُحَمَّدٍ",
+    tr: "Ash-hadu an la ilaha illallahu wahdahu la sharika lah, wa ash-hadu anna Muhammadan ‘abduhu wa rasuluh. Allahumma salli ‘ala Muhammadin wa Ali Muhammad",
+    en: "Then stand for the next rakat." },
+  tashahhudSalam: { step: "Tashahhud and salam — last rakat", say: "Final tashahhud, then salam.",
+    ar: "… اللّٰهُمَّ صَلِّ عَلَى مُحَمَّدٍ وَآلِ مُحَمَّدٍ ۝ السَّلَامُ عَلَيْكَ أَيُّهَا النَّبِيُّ وَرَحْمَةُ اللّٰهِ وَبَرَكَاتُهُ، السَّلَامُ عَلَيْنَا وَعَلَى عِبَادِ اللّٰهِ الصَّالِحِينَ، السَّلَامُ عَلَيْكُمْ وَرَحْمَةُ اللّٰهِ وَبَرَكَاتُهُ",
+    tr: "Tashahhud as before, then: As-salamu ‘alayka ayyuhan-nabiyyu… as-salamu ‘alayna… as-salamu ‘alaykum wa rahmatullahi wa barakatuh",
+    en: "End of prayer." },
+};
+
+// ---- Setup coach: talks you into position when you're testing alone (runs until calibrated) ----
+const COACH = {
+  nobody: "I can't see anyone. Please stand in front of the camera.",
+  farther: "Please step back. I can't see your head or your feet.",
+  head: "Your head is cut off. Step back, or tilt the phone up.",
+  feet: "I can't see your feet. Step back, or tilt the phone down.",
+  centre: "Move to the middle of the picture.",
+  closer: "Come a little closer.",
+  ok: "I can see your whole body. Now stand straight and still for two seconds.",
+};
+let setupMsg = "Stand where the camera can see you", lastCoach = { key: null, t: 0 };
+function coach(lm, now) {
+  const key = framing(lm);
+  setupMsg = COACH[key];
+  // Speak when the advice changes, or repeat it every 5 s so you don't need to look at the screen.
+  if (key !== lastCoach.key || now - lastCoach.t > 5000) {
+    lastCoach = { key, t: now };
+    say(COACH[key]);
+  }
+}
+
+let shownKey = null;
+function renderGuide() {
+  const on = $("guideOn").checked, step = on ? guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS }) : null;
+  const g = step && GUIDE[step.key];
+  $("guide").hidden = !g;
+  if (!g || step.key + step.rakat === shownKey) return;
+  shownKey = step.key + step.rakat;
+  $("gStep").textContent = `Rakat ${step.rakat} · ${g.step}`;
+  $("gAr").textContent = g.ar; $("gTr").textContent = g.tr; $("gEn").textContent = g.en;
 }
 
 function announce(seg) {
+  if (!ref) return;
+  if ($("guideOn").checked) {
+    const step = guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS });
+    const g = step && step.seg === seg && GUIDE[step.key];
+    if (g && seg.spoken !== step.key) { seg.spoken = step.key; say(g.say, step.key, g.ar.includes("…") ? null : g.ar); return; }
+    if (g || seg.spoken) return;
+  }
   const lbl = label(seg);
   if (seg.spoken === lbl || !PHRASES[lbl]) return;
   if (seg.end - seg.start < (SPEAK_AFTER_MS[lbl] ?? MIN_SEGMENT_MS)) return;

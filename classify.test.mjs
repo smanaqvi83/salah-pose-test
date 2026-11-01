@@ -52,6 +52,93 @@ console.log("ok — Ja'fari sequence notes");
 const hideKnees = (lm) => { [25, 26, 27, 28].forEach((i) => (lm[i] = { ...lm[i], visibility: 0.1 })); return lm; };
 assert.equal(classify(hideKnees(cases[2][1])).pose, "ruku");
 assert.equal(classify(hideKnees(cases[3][1])).pose, "sajda");
-assert.equal(classify(hideKnees(cases[0][1])).pose, "qiyam");
+const standRef = { hipY: 50 / 300, torso: 40 / 300 }; // hip height and torso length from cases[0]
+assert.equal(classify(hideKnees(cases[0][1])).pose, "transition", "no reference yet: must not guess");
+assert.equal(classify(cases[0][1], 1, { ref: standRef }).pose, "qiyam");
 assert.equal(classify(undefined).pose, "nobody");
 console.log("ok — hidden knees and no person");
+
+// FRONT camera (phone facing the person). Same 2D image for standing and ruku-ish, told apart by 3D.
+import { standingRef } from "./classify.js";
+const P = (x, y, z = 0, visibility = 0.9) => ({ x, y, z, visibility });
+function frontView({ noseY, shY, hipY, kneeVis = 0.9 }) {
+  const lm = Array.from({ length: 33 }, () => P(0.5, 0.5, 0, 0.1));
+  lm[0] = P(0.5, noseY);
+  lm[11] = P(0.42, shY); lm[12] = P(0.58, shY);
+  lm[15] = P(0.42, hipY + 0.05); lm[16] = P(0.58, hipY + 0.05); // hands low (at sides / on knees)
+  lm[23] = P(0.45, hipY); lm[24] = P(0.55, hipY);
+  lm[25] = P(0.45, hipY + 0.2, 0, kneeVis); lm[26] = P(0.55, hipY + 0.2, 0, kneeVis);
+  lm[27] = P(0.45, hipY + 0.4, 0, kneeVis); lm[28] = P(0.55, hipY + 0.4, 0, kneeVis);
+  return lm;
+}
+// World landmarks in metres, hip-centred, y down, -z toward the camera.
+const world = (shoulder, nose) => {
+  const w = Array.from({ length: 33 }, () => P(0, 0, 0));
+  w[0] = P(...nose);
+  w[11] = P(-0.18, ...shoulder.slice(1)); w[12] = P(0.18, ...shoulder.slice(1));
+  w[23] = P(-0.1, 0, 0); w[24] = P(0.1, 0, 0);
+  w[25] = P(-0.1, 0.45, 0); w[26] = P(0.1, 0.45, 0);
+  w[27] = P(-0.1, 0.9, 0); w[28] = P(0.1, 0.9, 0);
+  return w;
+};
+const standFront = frontView({ noseY: 0.15, shY: 0.25, hipY: 0.5 });
+const standRes = classify(standFront, 1, { world: world([0, -0.5, 0], [0, -0.65, 0]) });
+assert.equal(standRes.pose, "qiyam");
+const fref = standingRef(undefined, standFront, 1, standRes);
+assert.ok(fref && Math.abs(fref.hipY - 0.5) < 1e-9);
+
+// Ruku from the front: in 2D the torso just looks short; 3D shows it pitched toward the camera.
+const rukuFront = frontView({ noseY: 0.42, shY: 0.4, hipY: 0.5 });
+assert.notEqual(classify(rukuFront, 1).pose, "ruku", "2D alone can't see front ruku (the bug)");
+assert.equal(classify(rukuFront, 1, { world: world([0, -0.05, -0.48], [0, 0.02, -0.62]), ref: fref }).pose, "ruku");
+
+// Jalsa from the front with legs folded under the kameez: knees hidden, hips well below standing height.
+const sitFront = frontView({ noseY: 0.5, shY: 0.6, hipY: 0.85, kneeVis: 0.1 });
+assert.equal(classify(sitFront, 1, { world: world([0, -0.5, 0], [0, -0.65, 0]), ref: fref }).pose, "jalsa");
+
+// Sajda from the front: head on the floor, hips raised behind.
+const sajdaFront = frontView({ noseY: 0.9, shY: 0.8, hipY: 0.6, kneeVis: 0.2 });
+assert.equal(classify(sajdaFront, 1, { world: world([0, 0.25, -0.45], [0, 0.4, -0.6]), ref: fref }).pose, "sajda");
+console.log("ok — front camera: qiyam, ruku, jalsa, sajda");
+
+// Practice guide follows a 2-rakat (Fajr) prayer through every step.
+import { guideStep } from "./classify.js";
+t = 0;
+const fajr = [
+  ["qiyam", "qiyam"], ["ruku", "ruku"], ["qiyam", "qawmah"], ["sajda", "sajda"], ["jalsa", "betweenSajdas"],
+  ["sajda", "sajda"], ["jalsa", "istiraha"], ["qiyam", "qiyam"], ["qunoot", "qunoot"], ["qiyam", "qiyam"],
+  ["ruku", "ruku"], ["qiyam", "qawmah"], ["sajda", "sajda"], ["jalsa", "betweenSajdas"], ["sajda", "sajda"],
+  ["jalsa", "tashahhudSalam"],
+];
+const segsSoFar = [];
+for (const [pose, want] of fajr) {
+  segsSoFar.push(seg(pose, 3000));
+  segsSoFar.push(seg("transition", 500));
+  assert.equal(guideStep(segsSoFar, 2).key, want, `step ${segsSoFar.length / 2} (${pose})`);
+}
+// Rakat 3 of a 4-rakat prayer: standing means tasbihat, and the last sitting is tashahhud + salam.
+t = 0;
+const z = [];
+const push = (p) => { z.push(seg(p, 3000)); };
+for (let r = 1; r <= 4; r++) { push("qiyam"); push("ruku"); push("qiyam"); push("sajda"); push("jalsa"); push("sajda"); push("jalsa"); }
+assert.equal(guideStep(z.slice(0, 15), 4).key, "qiyamTasbihat");
+assert.equal(guideStep(z.slice(0, 14), 4).key, "tashahhud");
+assert.equal(guideStep(z, 4).key, "tashahhudSalam");
+console.log("ok — practice guide steps");
+
+// Framing hints for setting the phone up alone.
+import { framing } from "./classify.js";
+const frame = (noseY, ankleY, x = 0.5) => {
+  const lm = Array.from({ length: 33 }, () => ({ x, y: 0.5, visibility: 0.9 }));
+  lm[0] = { x, y: noseY, visibility: noseY < 0 ? 0.1 : 0.9 };
+  lm[27] = lm[28] = { x, y: ankleY, visibility: ankleY > 1 ? 0.1 : 0.9 };
+  return lm;
+};
+assert.equal(framing(undefined), "nobody");
+assert.equal(framing(frame(0.1, 0.9)), "ok");
+assert.equal(framing(frame(0.1, 1.2)), "feet");
+assert.equal(framing(frame(-0.1, 0.9)), "head");
+assert.equal(framing(frame(-0.1, 1.2)), "farther");
+assert.equal(framing(frame(0.4, 0.7)), "closer");
+assert.equal(framing(frame(0.1, 0.9, 0.1)), "centre");
+console.log("ok — framing hints");
