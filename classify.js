@@ -2,10 +2,6 @@
 // Input: 33 MediaPipe landmarks {x, y, visibility} (normalized 0..1), plus aspect = videoWidth / videoHeight.
 // Image y grows downward.
 
-const NOSE = 0;
-const LEFT = { shoulder: 11, wrist: 15, hip: 23, knee: 25, ankle: 27 };
-const RIGHT = { shoulder: 12, wrist: 16, hip: 24, knee: 26, ankle: 28 };
-export const MIN_VIS = 0.5;
 
 const deg = (r) => (r * 180) / Math.PI;
 
@@ -26,43 +22,56 @@ export function torsoTilt(shoulder, hip) {
   return deg(Math.acos(Math.max(-1, Math.min(1, (hip.y - shoulder.y) / len))));
 }
 
-// Camera sees one side best; use whichever side is more visible.
-function pickSide(lm) {
-  const v = (s) => Object.values(s).reduce((t, i) => t + (lm[i].visibility ?? 1), 0);
-  return v(LEFT) >= v(RIGHT) ? LEFT : RIGHT;
+// Combine left and right into one point per joint, weighted by visibility. From the side the far
+// limb is hidden, but MediaPipe still estimates it close to the near one, so the blend stays usable.
+function joint(lm, l, r, aspect) {
+  const a = lm[l], b = lm[r];
+  const va = a.visibility ?? 1, vb = b.visibility ?? 1, w = va + vb || 1;
+  return { x: ((a.x * va + b.x * vb) / w) * aspect, y: (a.y * va + b.y * vb) / w, v: Math.max(va, vb) };
 }
 
 // ponytail: hand-tuned thresholds from geometry, not from data. Ceiling: will misfire on unusual
-// bodies/camera angles. Upgrade path: log real sessions (export CSV), tune, or train a tiny classifier.
+// bodies/camera angles. Upgrade path: log real sessions (Export frames CSV), tune, or train a tiny classifier.
+export const TORSO_VIS = 0.3; // shoulders + hips must be at least this visible
+export const KNEE_VIS = 0.35; // below this the knee angle is ignored, not trusted
+
 export function classify(lm, aspect = 1) {
-  const side = pickSide(lm);
-  const p = (i) => ({ x: lm[i].x * aspect, y: lm[i].y, v: lm[i].visibility ?? 1 });
-  const nose = p(NOSE), wrist = p(side.wrist), sh = p(side.shoulder), hip = p(side.hip), knee = p(side.knee), ankle = p(side.ankle);
+  if (!lm) return { pose: "nobody", metrics: null, flags: {} };
+  const J = (l, r) => joint(lm, l, r, aspect);
+  const nose = { x: lm[0].x * aspect, y: lm[0].y, v: lm[0].visibility ?? 1 };
+  const sh = J(11, 12), wrist = J(15, 16), hip = J(23, 24), knee = J(25, 26), ankle = J(27, 28);
+  const torsoLen = Math.hypot(sh.x - hip.x, sh.y - hip.y) || 1e-6;
+  const kneeOk = knee.v >= KNEE_VIS && ankle.v >= KNEE_VIS * 0.7;
 
-  const vis = Math.min(sh.v, hip.v, knee.v);
   const metrics = {
-    knee: jointAngle(hip, knee, ankle),
-    hip: jointAngle(sh, hip, knee),
+    knee: kneeOk ? jointAngle(hip, knee, ankle) : null,
+    hip: knee.v >= KNEE_VIS ? jointAngle(sh, hip, knee) : null,
     tilt: torsoTilt(sh, hip),
-    headBelowHip: nose.y > hip.y,
-    vis,
+    headDrop: (nose.y - hip.y) / torsoLen, // >0: head below hips (sajda)
+    vis: Math.min(sh.v, hip.v),
+    kneeVis: knee.v,
   };
-  if (vis < MIN_VIS) return { pose: "unknown", metrics, flags: {} };
+  if (metrics.vis < TORSO_VIS) return { pose: "unknown", metrics, flags: {} };
 
-  const { knee: k, tilt } = metrics;
+  const { knee: k, tilt, headDrop } = metrics;
+  const bent = k !== null && k < 120, straight = k === null || k >= 140;
   let pose = "transition";
-  if (k < 120 && metrics.headBelowHip) pose = "sajda";
-  else if (k < 120 && tilt < 45) pose = "jalsa";
+  // Sajda: head clearly below hips with the torso tipped past horizontal. Doesn't need the knee.
+  if (headDrop > 0.25 && tilt > 100 && (k === null || k < 130)) pose = "sajda";
+  else if (bent && headDrop > 0) pose = "sajda";
+  else if (bent && tilt < 45) pose = "jalsa";
   // Qunoot (Ja'fari, 2nd rakat): standing with hands raised to face level. Brief raises are takbir —
   // the caller tells them apart by duration.
-  else if (k >= 140 && tilt < 25 && wrist.v >= MIN_VIS && wrist.y < sh.y) pose = "qunoot";
-  else if (k >= 140 && tilt < 25) pose = "qiyam";
-  else if (k >= 130 && tilt >= 55 && tilt <= 120) pose = "ruku";
+  else if (straight && tilt < 25 && wrist.v >= TORSO_VIS && wrist.y < sh.y) pose = "qunoot";
+  else if (straight && tilt < 25) pose = "qiyam";
+  // Ruku: torso roughly horizontal with legs straight (or legs hidden). Sitting with knee hidden can't
+  // reach this tilt band, so a hidden knee is accepted.
+  else if ((k === null || k >= 130) && tilt >= 55 && tilt <= 115) pose = "ruku";
 
   const flags = {};
   if (pose === "ruku") {
     flags.backFlat = Math.abs(tilt - 90) <= 15;
-    flags.kneesStraight = k >= 160;
+    flags.kneesStraight = k === null ? null : k >= 160;
   }
   return { pose, metrics, flags };
 }
@@ -78,14 +87,14 @@ export function annotate(segments, { minSegmentMs = 400, tumaninahMs = 1000 } = 
   const out = [];
   let prev = null, rukus = 0, qunootSeen = false;
   for (const s of segments) {
-    if (dur(s) < minSegmentMs || s.pose === "unknown") continue;
+    if (dur(s) < minSegmentMs || s.pose === "unknown" || s.pose === "nobody") continue;
     const n = [];
     if (["qiyam", "ruku", "sajda", "jalsa"].includes(s.pose) && s.stillMs < tumaninahMs) n.push("rushed (not still ≥1s)");
     if (s.pose === "ruku") {
       rukus++;
       if (s.rukuFrames) {
         if (s.backFlat / s.rukuFrames < 0.6) n.push("back not flat");
-        if (s.kneesStraight / s.rukuFrames < 0.6) n.push("knees bent");
+        if (s.kneesSeen && s.kneesStraight / s.kneesSeen < 0.6) n.push("knees bent");
       }
       if (rukus === 2 && !qunootSeen) n.push("qunoot not detected before this ruku (mustahab)");
     }

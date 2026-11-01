@@ -55,12 +55,14 @@
     <button class="primary" id="start">Start camera</button>
     <button id="flip" disabled>Switch camera</button>
     <select id="model" aria-label="Model">
-      <option value="lite">Model: lite (fast)</option>
-      <option value="full">Model: full (more accurate)</option>
+      <option value="full" selected>Model: full (recommended)</option>
+      <option value="heavy">Model: heavy (most accurate, slow phones lag)</option>
+      <option value="lite">Model: lite (fastest, weakest in sajda)</option>
     </select>
     <label class="toggle"><input type="checkbox" id="speak"> Speak positions</label>
     <select id="voice" aria-label="Voice" hidden></select>
     <button id="export" disabled>Export CSV</button>
+    <button id="exportFrames" disabled>Export frames</button>
     <button id="clear">Clear log</button>
   </div>
   <div id="status">Tap Start. First load downloads the model (~5–10 MB), then it works offline from cache.</div>
@@ -69,7 +71,8 @@
     <div class="metric"><span>Knee angle</span><b id="mKnee">–</b></div>
     <div class="metric"><span>Torso tilt</span><b id="mTilt">–</b></div>
     <div class="metric"><span>Hip angle</span><b id="mHip">–</b></div>
-    <div class="metric"><span>Visibility</span><b id="mVis">–</b></div>
+    <div class="metric"><span>Torso visibility</span><b id="mVis">–</b></div>
+    <div class="metric"><span>Knee visibility</span><b id="mKneeVis">–</b></div>
     <div class="metric"><span>Motion</span><b id="mMotion">–</b></div>
     <div class="metric"><span>FPS</span><b id="mFps">–</b></div>
   </div>
@@ -87,6 +90,7 @@ import { classify, annotate as annotateSegments, label, dur } from "./classify.j
 const MODELS = {
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
   full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
 };
 const SMOOTH_FRAMES = 7;      // majority vote window
 const SMOOTH_MIN = 5;         // votes needed to switch stable pose
@@ -107,6 +111,8 @@ async function loadModel() {
   const opts = (delegate) => ({
     baseOptions: { modelAssetPath: MODELS[$("model").value], delegate },
     runningMode: "VIDEO", numPoses: 1,
+    // Defaults are 0.5; a folded body in sajda often scores lower and gets dropped as "no person".
+    minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
   });
   try { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
   catch { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
@@ -137,7 +143,7 @@ $("start").onclick = async () => {
     await startCamera();
     await keepAwake();
     running = true;
-    $("flip").disabled = false; $("export").disabled = false;
+    $("flip").disabled = false; $("export").disabled = false; $("exportFrames").disabled = false;
     $("status").textContent = wakeLock ? "Running. Screen will stay on." : "Running. Keep the screen on manually (wake lock unsupported).";
     requestAnimationFrame(loop);
   } catch (e) {
@@ -149,6 +155,7 @@ $("flip").onclick = async () => { facing = facing === "user" ? "environment" : "
 $("model").onchange = () => { landmarker?.close(); landmarker = null; if (running) loadModel(); };
 $("clear").onclick = () => { segments = []; current = null; renderLog(); };
 $("export").onclick = exportCsv;
+$("exportFrames").onclick = exportFrames;
 
 function loop(now) {
   if (!running) return;
@@ -162,7 +169,7 @@ function loop(now) {
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const lm = res.landmarks?.[0];
-  if (!lm) { update("unknown", null, {}, now); return; }
+  if (!lm) { update("nobody", null, {}, now); return; }
 
   drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#3fbf7f", lineWidth: 4 });
   drawer.drawLandmarks(lm, { color: "#e8efe9", radius: 3 });
@@ -190,13 +197,16 @@ function update(pose, metrics, flags, now) {
   const [top, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
   if (n >= SMOOTH_MIN && top !== stable) switchSegment(top, now);
 
-  const still = motionAvg < STILL_THRESHOLD && stable !== "unknown";
+  logFrame(now, pose, metrics);
+  const lost = stable === "unknown" || stable === "nobody";
+  const still = motionAvg < STILL_THRESHOLD && !lost;
   if (current) {
     const dt = now - (current.lastT ?? now);
     if (still) current.stillMs += dt;
     if (stable === "ruku" && pose === "ruku") {
       current.rukuFrames++;
       if (flags.backFlat) current.backFlat++;
+      if (flags.kneesStraight !== null) current.kneesSeen++;
       if (flags.kneesStraight) current.kneesStraight++;
     }
     current.lastT = now;
@@ -205,16 +215,18 @@ function update(pose, metrics, flags, now) {
   }
 
   $("pose").textContent = current ? label(current) : "—";
-  $("pose").className = stable === "unknown" ? "bad" : stable === "transition" ? "warn" : "ok";
-  $("still").textContent = current && stable !== "unknown" && stable !== "transition"
-    ? (still ? "Still " : "Moving ") + ((current.end - current.start) / 1000).toFixed(1) + "s" : "";
+  $("pose").className = lost ? "bad" : stable === "transition" ? "warn" : "ok";
+  $("still").textContent = stable === "nobody" ? "No person found — step back so head to feet fit"
+    : stable === "unknown" ? "Shoulders/hips unclear — better light or plainer background"
+    : current && stable !== "transition" ? (still ? "Still " : "Moving ") + ((current.end - current.start) / 1000).toFixed(1) + "s" : "";
   $("still").className = still ? "ok" : "warn";
   $("rakat").textContent = "Rakats: " + segments.filter((s) => s.pose === "ruku" && s.end - s.start >= MIN_SEGMENT_MS).length;
   if (metrics) {
-    $("mKnee").textContent = metrics.knee.toFixed(0) + "°";
+    $("mKnee").textContent = metrics.knee === null ? "hidden" : metrics.knee.toFixed(0) + "°";
     $("mTilt").textContent = metrics.tilt.toFixed(0) + "°";
-    $("mHip").textContent = metrics.hip.toFixed(0) + "°";
+    $("mHip").textContent = metrics.hip === null ? "hidden" : metrics.hip.toFixed(0) + "°";
     $("mVis").textContent = metrics.vis.toFixed(2);
+    $("mKneeVis").textContent = metrics.kneeVis.toFixed(2);
   }
   $("mMotion").textContent = motionAvg.toFixed(2);
   $("mFps").textContent = fpsAvg.toFixed(0);
@@ -225,8 +237,9 @@ function update(pose, metrics, flags, now) {
 // otherwise the best text-to-speech voice on the phone.
 // ponytail: TTS quality is whatever the phone has installed. Ceiling: some cheap Androids only ship a robotic voice.
 // Upgrade path: recorded clips for every prompt (already supported, just drop the files in audio/).
-const PHRASES = { qiyam: "Standing", qunoot: "Qunoot", ruku: "Rukoo", sajda: "Sajdah", jalsa: "Sitting", unknown: "I can't see you fully" };
-const SPEAK_AFTER_MS = { unknown: 2000, qunoot: 0 }; // qunoot label itself only appears after 2s; others: MIN_SEGMENT_MS
+const PHRASES = { qiyam: "Standing", qunoot: "Qunoot", ruku: "Rukoo", sajda: "Sajdah", jalsa: "Sitting",
+  unknown: "I can't see your body clearly", nobody: "I can't see anyone. Please step into the frame." };
+const SPEAK_AFTER_MS = { unknown: 2000, nobody: 2000, qunoot: 0 }; // qunoot label itself only appears after 2s; others: MIN_SEGMENT_MS
 const clips = {};
 for (const pose of Object.keys(PHRASES)) {
   const a = new Audio(`audio/${pose}.mp3`);
@@ -285,7 +298,7 @@ function announce(seg) {
 
 function switchSegment(pose, now) {
   stable = pose;
-  current = { pose, start: now, end: now, stillMs: 0, rukuFrames: 0, backFlat: 0, kneesStraight: 0 };
+  current = { pose, start: now, end: now, stillMs: 0, rukuFrames: 0, backFlat: 0, kneesStraight: 0, kneesSeen: 0 };
   segments.push(current);
   renderLog();
 }
@@ -300,18 +313,33 @@ function renderLog() {
 }
 setInterval(() => running && renderLog(), 1000);
 
+// Raw per-frame log for tuning thresholds against real prayers (segments alone hide why a frame failed).
+const frames = [];
+const MAX_FRAMES = 20000; // ~20 min at 15 fps
+function logFrame(now, pose, m) {
+  if (frames.length >= MAX_FRAMES) frames.shift();
+  frames.push([Math.round(now), pose, m?.knee?.toFixed(0) ?? "", m?.tilt?.toFixed(0) ?? "", m?.hip?.toFixed(0) ?? "",
+    m?.headDrop?.toFixed(2) ?? "", m?.vis?.toFixed(2) ?? "", m?.kneeVis?.toFixed(2) ?? "", motionAvg.toFixed(2)].join(","));
+}
+function exportFrames() {
+  download("frames", ["t_ms,pose,knee,tilt,hip,head_drop,torso_vis,knee_vis,motion", ...frames].join("\n"));
+}
+function download(kind, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
+  a.download = `salah-${kind}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.csv`;
+  a.click();
+}
+
 function exportCsv() {
   const t0 = segments[0]?.start ?? 0;
   const lines = ["index,pose,start_s,duration_s,still_s,ruku_back_flat_pct,ruku_knees_straight_pct,notes"];
   annotate().forEach(({ s, label, notes: n }, i) => {
     const pct = (x) => (s.rukuFrames ? Math.round((100 * x) / s.rukuFrames) : "");
     lines.push([i + 1, label, ((s.start - t0) / 1000).toFixed(1), (dur(s) / 1000).toFixed(1),
-      (s.stillMs / 1000).toFixed(1), pct(s.backFlat), pct(s.kneesStraight), `"${n.join("; ")}"`].join(","));
+      (s.stillMs / 1000).toFixed(1), pct(s.backFlat), s.kneesSeen ? Math.round((100 * s.kneesStraight) / s.kneesSeen) : "", `"${n.join("; ")}"`].join(","));
   });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
-  a.download = `salah-test-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.csv`;
-  a.click();
+  download("segments", lines.join("\n"));
 }
 </script>
 </body>
