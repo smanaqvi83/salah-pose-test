@@ -102,9 +102,16 @@
   </table>
 </main>
 
+<script>
+  // If the app script fails to load (e.g. a stale cached file), say so instead of a dead Start button.
+  window.addEventListener("error", (e) => {
+    const el = document.getElementById("status");
+    if (el) el.textContent = "Error: " + (e.message || e.error) + " — close this tab and open the link again.";
+  });
+</script>
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js";
+import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js?v=4";
 
 const MODELS = {
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
