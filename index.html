@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Salah Pose Test</title>
+<style>
+  :root { --bg:#0f1412; --fg:#e8efe9; --muted:#8fa197; --accent:#3fbf7f; --warn:#e0a83a; --bad:#e05a4f; --card:#18201c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 system-ui, sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:12px 16px 40px; }
+  h1 { font-size:18px; margin:4px 0 12px; color:var(--muted); font-weight:600; }
+  .stage { position:relative; width:100%; background:#000; border-radius:12px; overflow:hidden; }
+  video, canvas { display:block; width:100%; height:auto; }
+  canvas { position:absolute; inset:0; height:100%; }
+  .mirror { transform:scaleX(-1); }
+  .hud { position:absolute; left:0; right:0; top:0; padding:10px 14px; display:flex; justify-content:space-between; align-items:flex-start;
+         background:linear-gradient(#000a, #0000); pointer-events:none; }
+  #pose { font-size:clamp(32px, 9vw, 64px); font-weight:800; text-transform:capitalize; }
+  #still { font-size:clamp(16px, 4vw, 24px); font-weight:700; }
+  #rakat { font-size:clamp(16px, 4vw, 24px); text-align:right; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+  button, select { background:var(--card); color:var(--fg); border:1px solid #2c3832; border-radius:8px; padding:10px 14px; font:inherit; min-height:44px; }
+  button.primary { background:var(--accent); color:#06140c; border:0; font-weight:700; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(130px,1fr)); gap:8px; }
+  .metric { background:var(--card); border-radius:8px; padding:8px 10px; }
+  .metric b { display:block; font-size:22px; }
+  .metric span { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #26302b; }
+  th { color:var(--muted); font-weight:600; }
+  .ok { color:var(--accent); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .toggle { display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid #2c3832; border-radius:8px; padding:0 14px; min-height:44px; }
+  .toggle input { width:20px; height:20px; accent-color:var(--accent); }
+  #status { color:var(--muted); font-size:14px; margin-top:6px; min-height:1.4em; }
+  .tip { color:var(--muted); font-size:14px; background:var(--card); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Salah pose kill-test · Fiqh Ja'fari · processing stays on this device</h1>
+  <div class="tip"><b>Speak positions</b> is for practice runs (going through the motions), not a real fard prayer.</div>
+  <div class="tip">Place the phone <b>to your side</b>, about <b>2–2.5 m</b> away, around hip height, with your whole body (head to feet) in frame. Landscape works best.</div>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="hud">
+      <div><div id="pose">—</div><div id="still"></div></div>
+      <div id="rakat">Rakats: 0</div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="start">Start camera</button>
+    <button id="flip" disabled>Switch camera</button>
+    <select id="model" aria-label="Model">
+      <option value="lite">Model: lite (fast)</option>
+      <option value="full">Model: full (more accurate)</option>
+    </select>
+    <label class="toggle"><input type="checkbox" id="speak"> Speak positions</label>
+    <select id="voice" aria-label="Voice" hidden></select>
+    <button id="export" disabled>Export CSV</button>
+    <button id="clear">Clear log</button>
+  </div>
+  <div id="status">Tap Start. First load downloads the model (~5–10 MB), then it works offline from cache.</div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="metric"><span>Knee angle</span><b id="mKnee">–</b></div>
+    <div class="metric"><span>Torso tilt</span><b id="mTilt">–</b></div>
+    <div class="metric"><span>Hip angle</span><b id="mHip">–</b></div>
+    <div class="metric"><span>Visibility</span><b id="mVis">–</b></div>
+    <div class="metric"><span>Motion</span><b id="mMotion">–</b></div>
+    <div class="metric"><span>FPS</span><b id="mFps">–</b></div>
+  </div>
+
+  <table>
+    <thead><tr><th>#</th><th>Position</th><th>Held</th><th>Still</th><th>Notes</th></tr></thead>
+    <tbody id="log"></tbody>
+  </table>
+</main>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { classify, annotate as annotateSegments, label, dur } from "./classify.js";
+
+const MODELS = {
+  lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+};
+const SMOOTH_FRAMES = 7;      // majority vote window
+const SMOOTH_MIN = 5;         // votes needed to switch stable pose
+const STILL_THRESHOLD = 0.25; // torso-lengths per second; ponytail: hand-picked, tune from exported runs
+const MIN_SEGMENT_MS = 400;   // ignore flicker shorter than this in the log
+const TUMANINAH_MS = 1000;    // stillness needed to count as a calm, settled position
+const KEY_POINTS = [0, 11, 12, 23, 24, 25, 26, 27, 28]; // wrists excluded so qunoot hands do not break stillness
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let landmarker, drawer, stream, facing = "environment", running = false, wakeLock;
+let history = [], stable = null, segments = [], current = null;
+let prevPts = null, prevT = 0, motionAvg = 0, fpsAvg = 0, lastDetect = 0;
+
+async function loadModel() {
+  $("status").textContent = "Loading pose model…";
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODELS[$("model").value], delegate },
+    runningMode: "VIDEO", numPoses: 1,
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
+  drawer = new DrawingUtils(ctx);
+}
+
+async function startCamera() {
+  stream?.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  const mirror = facing === "user";
+  video.classList.toggle("mirror", mirror);
+  canvas.classList.toggle("mirror", mirror);
+}
+
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* not supported: user must keep screen on */ }
+}
+document.addEventListener("visibilitychange", () => { if (running && document.visibilityState === "visible") keepAwake(); });
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  try {
+    if (!landmarker) await loadModel();
+    await startCamera();
+    await keepAwake();
+    running = true;
+    $("flip").disabled = false; $("export").disabled = false;
+    $("status").textContent = wakeLock ? "Running. Screen will stay on." : "Running. Keep the screen on manually (wake lock unsupported).";
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("status").textContent = "Could not start: " + e.message + (location.protocol !== "https:" ? " (camera needs HTTPS)" : "");
+    $("start").disabled = false;
+  }
+};
+$("flip").onclick = async () => { facing = facing === "user" ? "environment" : "user"; await startCamera(); };
+$("model").onchange = () => { landmarker?.close(); landmarker = null; if (running) loadModel(); };
+$("clear").onclick = () => { segments = []; current = null; renderLog(); };
+$("export").onclick = exportCsv;
+
+function loop(now) {
+  if (!running) return;
+  requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2 || now - lastDetect < 66) return; // ~15 fps is plenty for prayer
+  if (fpsAvg === 0 && lastDetect) fpsAvg = 1000 / (now - lastDetect);
+  else if (lastDetect) fpsAvg = fpsAvg * 0.9 + (1000 / (now - lastDetect)) * 0.1;
+  lastDetect = now;
+
+  const res = landmarker.detectForVideo(video, now);
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const lm = res.landmarks?.[0];
+  if (!lm) { update("unknown", null, {}, now); return; }
+
+  drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#3fbf7f", lineWidth: 4 });
+  drawer.drawLandmarks(lm, { color: "#e8efe9", radius: 3 });
+
+  const { pose, metrics, flags } = classify(lm, video.videoWidth / video.videoHeight);
+  trackMotion(lm, now);
+  update(pose, metrics, flags, now);
+}
+
+// Average landmark speed, normalized by torso length so distance from camera doesn't matter.
+function trackMotion(lm, now) {
+  const torso = Math.hypot(lm[11].x - lm[23].x, lm[11].y - lm[23].y) || 1;
+  const pts = KEY_POINTS.map((i) => [lm[i].x, lm[i].y]);
+  if (prevPts && now > prevT) {
+    const d = pts.reduce((s, p, i) => s + Math.hypot(p[0] - prevPts[i][0], p[1] - prevPts[i][1]), 0) / pts.length;
+    const speed = d / torso / ((now - prevT) / 1000);
+    motionAvg = motionAvg * 0.7 + speed * 0.3;
+  }
+  prevPts = pts; prevT = now;
+}
+
+function update(pose, metrics, flags, now) {
+  history.push(pose); if (history.length > SMOOTH_FRAMES) history.shift();
+  const counts = history.reduce((m, p) => (m[p] = (m[p] || 0) + 1, m), {});
+  const [top, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (n >= SMOOTH_MIN && top !== stable) switchSegment(top, now);
+
+  const still = motionAvg < STILL_THRESHOLD && stable !== "unknown";
+  if (current) {
+    const dt = now - (current.lastT ?? now);
+    if (still) current.stillMs += dt;
+    if (stable === "ruku" && pose === "ruku") {
+      current.rukuFrames++;
+      if (flags.backFlat) current.backFlat++;
+      if (flags.kneesStraight) current.kneesStraight++;
+    }
+    current.lastT = now;
+    current.end = now;
+    announce(current);
+  }
+
+  $("pose").textContent = current ? label(current) : "—";
+  $("pose").className = stable === "unknown" ? "bad" : stable === "transition" ? "warn" : "ok";
+  $("still").textContent = current && stable !== "unknown" && stable !== "transition"
+    ? (still ? "Still " : "Moving ") + ((current.end - current.start) / 1000).toFixed(1) + "s" : "";
+  $("still").className = still ? "ok" : "warn";
+  $("rakat").textContent = "Rakats: " + segments.filter((s) => s.pose === "ruku" && s.end - s.start >= MIN_SEGMENT_MS).length;
+  if (metrics) {
+    $("mKnee").textContent = metrics.knee.toFixed(0) + "°";
+    $("mTilt").textContent = metrics.tilt.toFixed(0) + "°";
+    $("mHip").textContent = metrics.hip.toFixed(0) + "°";
+    $("mVis").textContent = metrics.vis.toFixed(2);
+  }
+  $("mMotion").textContent = motionAvg.toFixed(2);
+  $("mFps").textContent = fpsAvg.toFixed(0);
+}
+
+// ---- Speak positions -------------------------------------------------------
+// Natural voice first: a human recording at audio/<pose>.mp3 if present (record your own, e.g. in Urdu),
+// otherwise the best text-to-speech voice on the phone.
+// ponytail: TTS quality is whatever the phone has installed. Ceiling: some cheap Androids only ship a robotic voice.
+// Upgrade path: recorded clips for every prompt (already supported, just drop the files in audio/).
+const PHRASES = { qiyam: "Standing", qunoot: "Qunoot", ruku: "Rukoo", sajda: "Sajdah", jalsa: "Sitting", unknown: "I can't see you fully" };
+const SPEAK_AFTER_MS = { unknown: 2000, qunoot: 0 }; // qunoot label itself only appears after 2s; others: MIN_SEGMENT_MS
+const clips = {};
+for (const pose of Object.keys(PHRASES)) {
+  const a = new Audio(`audio/${pose}.mp3`);
+  a.preload = "auto";
+  a.addEventListener("canplaythrough", () => (clips[pose] = a), { once: true });
+}
+
+// Rank installed voices: Google first, then other natural/online voices; "compact"/eSpeak ones sound robotic.
+// On Android, Chrome's voices come from the phone's TTS engine and aren't named "Google"; with
+// "Speech Services by Google" set as the engine, every voice listed is already Google's.
+function voiceScore(v) {
+  const n = v.name.toLowerCase();
+  let score = 0;
+  if (/google/.test(n)) score += 100; // chosen voice: Google (desktop Chrome names them "Google …")
+  if (/natural|neural|premium|enhanced/.test(n)) score += 50;
+  if (!v.localService) score += 10; // online voices are usually the higher-quality ones
+  if (/compact|espeak|robot/.test(n)) score -= 50;
+  if (/^en-(gb|in|us)/i.test(v.lang)) score += 5;
+  return score;
+}
+function loadVoices() {
+  const voices = speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang)).sort((a, b) => voiceScore(b) - voiceScore(a));
+  const sel = $("voice");
+  const keep = sel.value;
+  sel.innerHTML = voices.map((v) => `<option value="${v.name}">${v.name} (${v.lang})</option>`).join("");
+  if (keep && voices.some((v) => v.name === keep)) sel.value = keep;
+  sel.hidden = !$("speak").checked || voices.length === 0;
+}
+if ("speechSynthesis" in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+
+$("speak").onchange = () => {
+  loadVoices();
+  if ($("speak").checked) say("Okay, I'll call out your positions."); // also unlocks audio on mobile (needs a tap)
+};
+$("voice").onchange = () => say("This is how I sound.");
+
+function say(text, pose) {
+  if (!$("speak").checked) return;
+  const clip = pose && clips[pose];
+  if (clip) { clip.currentTime = 0; clip.play().catch(() => {}); return; }
+  if (!("speechSynthesis" in window)) return;
+  speechSynthesis.cancel(); // drop stale callouts so speech never lags behind the body
+  const u = new SpeechSynthesisUtterance(text);
+  u.voice = speechSynthesis.getVoices().find((v) => v.name === $("voice").value) ?? null;
+  u.rate = 0.95; u.pitch = 1.0; u.volume = 1;
+  speechSynthesis.speak(u);
+}
+
+function announce(seg) {
+  const lbl = label(seg);
+  if (seg.spoken === lbl || !PHRASES[lbl]) return;
+  if (seg.end - seg.start < (SPEAK_AFTER_MS[lbl] ?? MIN_SEGMENT_MS)) return;
+  seg.spoken = lbl;
+  say(PHRASES[lbl], lbl);
+}
+
+function switchSegment(pose, now) {
+  stable = pose;
+  current = { pose, start: now, end: now, stillMs: 0, rukuFrames: 0, backFlat: 0, kneesStraight: 0 };
+  segments.push(current);
+  renderLog();
+}
+
+const annotate = () => annotateSegments(segments, { minSegmentMs: MIN_SEGMENT_MS, tumaninahMs: TUMANINAH_MS });
+
+function renderLog() {
+  const rows = annotate().slice(-40).reverse();
+  $("log").innerHTML = rows.map(({ s, label, notes: n }, i) =>
+    `<tr><td>${rows.length - i}</td><td>${label}</td><td>${(dur(s) / 1000).toFixed(1)}s</td>` +
+    `<td>${(s.stillMs / 1000).toFixed(1)}s</td><td class="${n.length ? "warn" : "ok"}">${n.join(", ") || "ok"}</td></tr>`).join("");
+}
+setInterval(() => running && renderLog(), 1000);
+
+function exportCsv() {
+  const t0 = segments[0]?.start ?? 0;
+  const lines = ["index,pose,start_s,duration_s,still_s,ruku_back_flat_pct,ruku_knees_straight_pct,notes"];
+  annotate().forEach(({ s, label, notes: n }, i) => {
+    const pct = (x) => (s.rukuFrames ? Math.round((100 * x) / s.rukuFrames) : "");
+    lines.push([i + 1, label, ((s.start - t0) / 1000).toFixed(1), (dur(s) / 1000).toFixed(1),
+      (s.stillMs / 1000).toFixed(1), pct(s.backFlat), pct(s.kneesStraight), `"${n.join("; ")}"`].join(","));
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  a.download = `salah-test-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.csv`;
+  a.click();
+}
+</script>
+</body>
+</html>
