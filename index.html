@@ -40,6 +40,14 @@
   .guide .ar { font-family:"Amiri", "Noto Naskh Arabic", "Scheherazade New", serif; font-size:clamp(24px, 6vw, 36px); line-height:1.9; direction:rtl; text-align:right; margin:6px 0; }
   .guide .tr { font-style:italic; }
   .guide .en { color:var(--muted); font-size:14px; margin-top:4px; }
+  .report { background:var(--card); border-radius:12px; padding:14px 16px; margin-top:12px; }
+  .report h2 { margin:0 0 4px; font-size:20px; }
+  .report h3 { margin:14px 0 4px; font-size:15px; color:var(--muted); }
+  .report ul { list-style:none; padding:0; margin:0; }
+  .report li { padding:6px 0; border-bottom:1px solid #26302b; display:flex; gap:10px; }
+  .report li b { flex:0 0 1.2em; text-align:center; }
+  .report .note { color:var(--muted); font-size:13px; margin-top:10px; }
+  details.tip input { background:#0f1412; color:var(--fg); border:1px solid #2c3832; border-radius:8px; padding:10px; font:inherit; margin:4px 0 8px; }
   .tip { color:var(--muted); font-size:14px; background:var(--card); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
 </style>
 </head>
@@ -47,7 +55,7 @@
 <main>
   <h1>Salah pose kill-test · Fiqh Ja'fari · processing stays on this device</h1>
   <div class="tip"><b>Practice guide</b> and <b>Speak</b> are for practice runs (going through the motions), not a real fard prayer.</div>
-  <div class="tip">Put the phone <b>in front of you or to your side</b>, 2–2.5 m away, around hip height, with your whole body (head to feet) in frame. <b>Stand straight for 2 seconds first</b> so it learns your standing height.</div>
+  <div class="tip">Put the phone <b>behind you or to your left/right</b> (not in front, so you never bow toward it), 2–2.5 m away, around hip height, with your whole body (head to feet) in frame. <b>Stand straight for 2 seconds first</b> so it learns your standing height.</div>
 
   <div class="stage" id="stage">
     <video id="video" playsinline muted></video>
@@ -73,6 +81,9 @@
     </select>
     <label class="toggle"><input type="checkbox" id="guideOn" checked> Practice guide</label>
     <label class="toggle"><input type="checkbox" id="speak" checked> Speak</label>
+    <label class="toggle"><input type="checkbox" id="listen" checked> Listen for recitation</label>
+    <button id="finish" disabled>Finish prayer</button>
+    <button id="newPrayer">New prayer</button>
     <select id="voice" aria-label="Voice" hidden></select>
     <button id="export" disabled>Export CSV</button>
     <button id="exportFrames" disabled>Export frames</button>
@@ -84,7 +95,21 @@
     <div class="tr" id="gTr"></div>
     <div class="en" id="gEn"></div>
   </div>
+  <section class="report" id="report" hidden aria-live="polite">
+    <h2 id="rTitle"></h2>
+    <div id="rSummary"></div>
+    <div id="rBody"></div>
+    <div class="note">Feedback is about posture, stillness and whether you were heard reciting. It can't check the correctness of your recitation or whether a prayer is valid, so ask an alim about that.</div>
+  </section>
   <div id="status">Tap Start. First load downloads the model (~5–10 MB), then it works offline from cache.</div>
+
+  <details class="tip" id="ghBox">
+    <summary><b>Save sessions to GitHub</b> <span id="ghState"></span></summary>
+    <p>After each prayer, the feedback and measurements (numbers only, never pictures or sound) are uploaded to a <b>private</b> repo. The token stays on this phone only.</p>
+    <label>Repo <input id="ghRepo" placeholder="smanaqvi83/salah-sessions" autocomplete="off" style="width:100%"></label>
+    <label>Token <input id="ghToken" type="password" placeholder="github_pat_…" autocomplete="off" style="width:100%"></label>
+    <div class="controls"><button id="ghSave">Save</button><button id="ghUpload">Upload last session now</button><button id="ghForget">Remove token</button></div>
+  </details>
 
   <div class="grid" style="margin-top:12px">
     <div class="metric"><span>Knee angle</span><b id="mKnee">–</b></div>
@@ -111,7 +136,7 @@
 </script>
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js?v=5";
+import { classify, standingRef, guideStep, prayerSteps, prayerReport, framing, annotate as annotateSegments, label, dur } from "./classify.js?v=7";
 
 const MODELS = {
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -129,6 +154,7 @@ const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 let landmarker, drawer, stream, facing = "environment", running = false, wakeLock;
 let history = [], stable = null, segments = [], current = null;
+let mic = null, reported = false, lastLm = null, lastVoice = false, sessionStart = new Date();
 let ref = null; // standing hip height + torso length, learned while standing straight
 let prevPts = null, prevT = 0, motionAvg = 0, fpsAvg = 0, lastDetect = 0;
 
@@ -169,8 +195,9 @@ $("start").onclick = async () => {
     if (!landmarker) await loadModel();
     await startCamera();
     await keepAwake();
+    if ($("listen").checked) await startMic();
     running = true;
-    $("flip").disabled = false; $("export").disabled = false; $("exportFrames").disabled = false;
+    $("flip").disabled = false; $("finish").disabled = false; $("export").disabled = false; $("exportFrames").disabled = false;
     $("status").textContent = wakeLock ? "Running. Screen will stay on." : "Running. Keep the screen on manually (wake lock unsupported).";
     requestAnimationFrame(loop);
   } catch (e) {
@@ -198,6 +225,7 @@ function loop(now) {
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const lm = res.landmarks?.[0];
+  lastLm = lm ?? null;
   if (!lm) { if (!ref) coach(null, now); update("nobody", null, {}, now); return; }
 
   drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color: "#3fbf7f", lineWidth: 4 });
@@ -216,6 +244,33 @@ function loop(now) {
 
 // Average landmark speed, normalized by torso length so distance from camera doesn't matter.
 // Only clearly visible points count: hidden joints jitter and would make every hold look "rushed".
+// ---- Recitation detection: on-device loudness check only. Nothing is recorded, stored or sent. ----
+// ponytail: detects THAT you spoke, not WHAT. Ceiling: a TV or someone talking nearby counts as voice.
+// Upgrade path: on-device Arabic keyword spotting for the tasbih (a small trained model).
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const an = ac.createAnalyser(); an.fftSize = 1024;
+    ac.createMediaStreamSource(stream).connect(an);
+    mic = { an, buf: new Float32Array(an.fftSize), floor: -60 };
+  } catch (e) {
+    mic = null; $("listen").checked = false;
+    $("status").textContent += " · Microphone off (" + e.message + "): recitation won't be checked.";
+  }
+}
+function voiceActive() {
+  if (!mic) return false;
+  // Don't count the app's own voice.
+  if (("speechSynthesis" in window && speechSynthesis.speaking) || Object.values(clips).some((c) => !c.paused)) return false;
+  mic.an.getFloatTimeDomainData(mic.buf);
+  const rms = Math.sqrt(mic.buf.reduce((a, x) => a + x * x, 0) / mic.buf.length);
+  const db = 20 * Math.log10(rms + 1e-9);
+  // Noise floor follows quiet moments quickly and loud ones slowly, so speech stands out from the room.
+  mic.floor = db < mic.floor ? mic.floor * 0.8 + db * 0.2 : mic.floor * 0.995 + db * 0.005;
+  return db > mic.floor + 12;
+}
+
 function trackMotion(lm, now) {
   const torso = ref?.torso || Math.hypot(lm[11].x - lm[23].x, lm[11].y - lm[23].y) || 1;
   const pts = KEY_POINTS.map((i) => [lm[i].x, lm[i].y, (lm[i].visibility ?? 1) >= 0.5]);
@@ -241,8 +296,11 @@ function update(pose, metrics, flags, now) {
   if (current) {
     const dt = now - (current.lastT ?? now);
     if (still) current.stillMs += dt;
+    lastVoice = voiceActive();
+    if (lastVoice) current.voiceMs += dt;
     if (stable === "ruku" && pose === "ruku") {
       current.rukuFrames++;
+      current.tiltSum += metrics.tilt;
       if (flags.backFlat) current.backFlat++;
       if (flags.kneesStraight !== null) current.kneesSeen++;
       if (flags.kneesStraight) current.kneesStraight++;
@@ -260,6 +318,7 @@ function update(pose, metrics, flags, now) {
   $("still").className = still ? "ok" : "warn";
   if (!ref) { $("still").textContent = setupMsg; $("still").className = "warn"; }
   renderGuide();
+  checkFinished();
   // Rakat comes from the prayer's structure (ruku, two sajdas, stand), not from counting ruku readings.
   $("rakat").textContent = "Rakat " + (guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS })?.rakat ?? 1);
   if (metrics) {
@@ -396,6 +455,122 @@ function coach(lm, now) {
   }
 }
 
+// ---- End-of-prayer report ----
+const total = () => +$("prayer").value;
+function checkFinished() {
+  if (reported || !ref) return;
+  const steps = prayerSteps(segments, total(), { minSegmentMs: MIN_SEGMENT_MS });
+  const last = steps[steps.length - 1];
+  if (last?.key === "tashahhudSalam" && last.segs.reduce((a, s) => a + dur(s), 0) >= 6000) showReport();
+}
+function showReport() {
+  reported = true;
+  const r = prayerReport(segments, total(), { voice: !!mic, minSegmentMs: MIN_SEGMENT_MS });
+  const icon = { good: "✓", improve: "!", unsure: "?" }, cls = { good: "ok", improve: "warn", unsure: "" };
+  const improve = r.items.filter((i) => i.level === "improve");
+  $("rTitle").textContent = `Prayer feedback · ${r.rakatsDone} of ${r.totalRakats} rakats`;
+  $("rSummary").textContent = improve.length ? `${improve.length} thing${improve.length > 1 ? "s" : ""} to work on.` : "Calm and complete. Nothing to fix.";
+  const li = (i) => `<li><b class="${cls[i.level]}" aria-label="${i.level}">${icon[i.level]}</b><span></span></li>`;
+  const groups = [null, ...Array.from({ length: Math.max(r.rakatsDone, 1) }, (_, k) => k + 1)];
+  $("rBody").innerHTML = groups.map((g) => {
+    const items = r.items.filter((i) => i.rakat === g);
+    return items.length ? `<h3>${g ? "Rakat " + g : "Overall"}</h3><ul>${items.map(li).join("")}</ul>` : "";
+  }).join("");
+  // Text goes in via textContent, never as HTML.
+  const spans = $("rBody").querySelectorAll("li span");
+  groups.flatMap((g) => r.items.filter((i) => i.rakat === g)).forEach((i, k) => (spans[k].textContent = i.text));
+  $("report").hidden = false;
+  $("report").scrollIntoView({ behavior: "smooth" });
+  const top = improve.slice(0, 2).map((i) => (i.rakat ? `In rakat ${i.rakat}: ` : "") + i.text).join(" ");
+  say(`Prayer complete. ${r.rakatsDone} rakats. ` + (top || "Your positions were calm and complete. Well done."));
+  lastReport = r;
+  uploadSession();
+}
+$("finish").onclick = () => showReport();
+
+// ---- Session upload to a PRIVATE GitHub repo (numbers only; no images, no audio) ----
+let lastReport = null;
+const store = { get: (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+                set: (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch {} } };
+$("ghRepo").value = store.get("ghRepo");
+const ghState = (t) => ($("ghState").textContent = t ? "· " + t : "");
+ghState(store.get("ghToken") ? "on" : "off");
+$("ghSave").onclick = () => {
+  const repo = $("ghRepo").value.trim(), token = $("ghToken").value.trim();
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return ghState("repo must look like owner/name");
+  store.set("ghRepo", repo);
+  if (token) store.set("ghToken", token);
+  $("ghToken").value = "";
+  ghState(store.get("ghToken") ? "on" : "token missing");
+};
+$("ghForget").onclick = () => { store.set("ghToken", ""); ghState("off"); };
+$("ghUpload").onclick = () => uploadSession();
+
+function sessionFiles() {
+  const id = sessionStart.toISOString().slice(0, 19).replace(/[:T]/g, "-") + "_" + total() + "rakat";
+  const r = lastReport ?? prayerReport(segments, total(), { voice: !!mic, minSegmentMs: MIN_SEGMENT_MS });
+  const q = (t) => `"${String(t).replace(/"/g, '""')}"`;
+  const meta = {
+    app: "salah-pose-test", version: 7, startedAt: sessionStart.toISOString(), endedAt: new Date().toISOString(),
+    prayerRakats: total(), rakatsCounted: r.rakatsDone, model: $("model").value, camera: facing,
+    video: `${video.videoWidth}x${video.videoHeight}`, fps: +fpsAvg.toFixed(1), micOn: !!mic,
+    standingRef: ref, userAgent: navigator.userAgent,
+    thresholds: { STILL_THRESHOLD, MIN_SEGMENT_MS, TUMANINAH_MS },
+  };
+  return {
+    id,
+    files: {
+      "meta.json": JSON.stringify(meta, null, 2),
+      "report.csv": ["rakat,level,text", ...r.items.map((i) => [i.rakat ?? "all", i.level, q(i.text)].join(","))].join("\n"),
+      "segments.csv": segmentsCsv(),
+      "frames.csv": [FRAME_COLS, ...frames].join("\n"),
+    },
+  };
+}
+
+const b64 = (text) => {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+async function gh(path, opts = {}) {
+  const res = await fetch("https://api.github.com" + path, {
+    ...opts,
+    headers: { Authorization: "Bearer " + store.get("ghToken"), Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`GitHub ${res.status}: ${body.message || "request failed"}`);
+  return body;
+}
+async function uploadSession() {
+  const repo = store.get("ghRepo");
+  if (!repo || !store.get("ghToken")) { ghState("off — add repo and token to save sessions"); return; }
+  if (!frames.length && !segments.length) { ghState("nothing to upload yet"); return; }
+  ghState("uploading…");
+  try {
+    // Prayer data must never land in a public repo.
+    const info = await gh(`/repos/${repo}`);
+    if (!info.private) throw new Error(`${repo} is public. Make it private first; nothing was uploaded`);
+    const { id, files } = sessionFiles();
+    for (const [name, text] of Object.entries(files)) {
+      await gh(`/repos/${repo}/contents/sessions/${id}/${name}`, {
+        method: "PUT", body: JSON.stringify({ message: `Session ${id}: ${name}`, content: b64(text) }),
+      });
+    }
+    ghState(`saved sessions/${id}`);
+  } catch (e) {
+    // Data stays in memory: "Upload last session now" retries, and Export buttons still work.
+    ghState("upload failed: " + e.message + " (tap Upload to retry)");
+  }
+}
+$("newPrayer").onclick = () => {
+  segments = []; current = null; stable = null; history = []; reported = false; shownKey = null;
+  frames.length = 0; lastReport = null; sessionStart = new Date();
+  $("report").hidden = true; renderLog(); renderGuide();
+  say("New prayer. Stand straight to begin.");
+};
+
 let shownKey = null;
 function renderGuide() {
   const on = $("guideOn").checked, step = on ? guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS }) : null;
@@ -412,8 +587,9 @@ function announce(seg) {
   if ($("guideOn").checked) {
     const step = guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS });
     const g = step && step.seg === seg && GUIDE[step.key];
-    if (g && seg.spoken !== step.key) { seg.spoken = step.key; say(g.say, step.key, g.ar.includes("…") ? null : g.ar); return; }
-    if (g || seg.spoken) return;
+    if (g && seg.spoken !== step.key) { seg.spoken = step.key; say(g.say, step.key, g.ar.includes("…") ? null : g.ar); }
+    // Guide mode speaks only guide steps (it waits until a position is confirmed); "can't see you" still speaks.
+    if (!["unknown", "nobody"].includes(seg.pose)) return;
   }
   const lbl = label(seg);
   if (seg.spoken === lbl || !PHRASES[lbl]) return;
@@ -424,7 +600,7 @@ function announce(seg) {
 
 function switchSegment(pose, now) {
   stable = pose;
-  current = { pose, start: now, end: now, stillMs: 0, rukuFrames: 0, backFlat: 0, kneesStraight: 0, kneesSeen: 0 };
+  current = { pose, start: now, end: now, stillMs: 0, voiceMs: 0, rukuFrames: 0, tiltSum: 0, backFlat: 0, kneesStraight: 0, kneesSeen: 0 };
   segments.push(current);
   renderLog();
 }
@@ -442,13 +618,20 @@ setInterval(() => running && renderLog(), 1000);
 // Raw per-frame log for tuning thresholds against real prayers (segments alone hide why a frame failed).
 const frames = [];
 const MAX_FRAMES = 20000; // ~20 min at 15 fps
+const FRAME_COLS = "t_ms,raw_pose,stable,step,rakat,tilt,tilt2d,tilt3d,knee,hip_angle,head_drop,hip_drop,torso_vis,knee_vis,wrist_vis,motion,voice,nose_y,shoulder_y,hip_y,knee_y,ankle_y,wrist_y,shoulder_w";
 function logFrame(now, pose, m) {
   if (frames.length >= MAX_FRAMES) frames.shift();
-  frames.push([Math.round(now), pose, m?.knee?.toFixed(0) ?? "", m?.tilt?.toFixed(0) ?? "", m?.hip?.toFixed(0) ?? "",
-    m?.headDrop?.toFixed(2) ?? "", m?.vis?.toFixed(2) ?? "", m?.kneeVis?.toFixed(2) ?? "", motionAvg.toFixed(2)].join(","));
+  const f = (x, d = 0) => (x === null || x === undefined ? "" : x.toFixed(d));
+  const lm = lastLm, y = (i) => (lm ? f((lm[i].y + lm[i + 1].y) / 2, 3) : "");
+  const st = guideStep(segments, total(), { minSegmentMs: MIN_SEGMENT_MS });
+  frames.push([Math.round(now), pose, stable ?? "", st?.key ?? "", st?.rakat ?? "",
+    f(m?.tilt), f(m?.tilt2d), f(m?.tilt3d), f(m?.knee), f(m?.hip), f(m?.headDrop, 2), f(m?.hipDrop, 2),
+    f(m?.vis, 2), f(m?.kneeVis, 2), lm ? f(Math.max(lm[15].visibility, lm[16].visibility), 2) : "",
+    motionAvg.toFixed(2), lastVoice ? 1 : 0,
+    lm ? f(lm[0].y, 3) : "", y(11), y(23), y(25), y(27), y(15), lm ? f(Math.abs(lm[11].x - lm[12].x), 3) : ""].join(","));
 }
 function exportFrames() {
-  download("frames", ["t_ms,pose,knee,tilt,hip,head_drop,torso_vis,knee_vis,motion", ...frames].join("\n"));
+  download("frames", [FRAME_COLS, ...frames].join("\n"));
 }
 function download(kind, text) {
   const a = document.createElement("a");
@@ -457,16 +640,17 @@ function download(kind, text) {
   a.click();
 }
 
-function exportCsv() {
+function segmentsCsv() {
   const t0 = segments[0]?.start ?? 0;
-  const lines = ["index,pose,start_s,duration_s,still_s,ruku_back_flat_pct,ruku_knees_straight_pct,notes"];
+  const lines = ["index,pose,start_s,duration_s,still_s,voice_s,ruku_back_flat_pct,ruku_knees_straight_pct,notes"];
   annotate().forEach(({ s, label, notes: n }, i) => {
     const pct = (x) => (s.rukuFrames ? Math.round((100 * x) / s.rukuFrames) : "");
     lines.push([i + 1, label, ((s.start - t0) / 1000).toFixed(1), (dur(s) / 1000).toFixed(1),
-      (s.stillMs / 1000).toFixed(1), pct(s.backFlat), s.kneesSeen ? Math.round((100 * s.kneesStraight) / s.kneesSeen) : "", `"${n.join("; ")}"`].join(","));
+      (s.stillMs / 1000).toFixed(1), ((s.voiceMs || 0) / 1000).toFixed(1), pct(s.backFlat), s.kneesSeen ? Math.round((100 * s.kneesStraight) / s.kneesSeen) : "", `"${n.join("; ")}"`].join(","));
   });
-  download("segments", lines.join("\n"));
+  return lines.join("\n");
 }
+function exportCsv() { download("segments", segmentsCsv()); }
 </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-// Pure pose classifier for a SIDE-VIEW camera. No DOM, no MediaPipe — testable with node.
+// Pure pose classifier for a phone at the SIDE, BEHIND or in FRONT of the person. No DOM, no MediaPipe — testable with node.
 // Input: 33 MediaPipe landmarks {x, y, visibility} (normalized 0..1), plus aspect = videoWidth / videoHeight.
 // Image y grows downward.
 
@@ -55,12 +55,13 @@ export function classify(lm, aspect = 1, { world, ref } = {}) {
 
   // Prefer 3D for angles: correct from the front and the side. Fall back to 2D when absent.
   const g = world ? { sh: W(11, 12), hip: W(23, 24), knee: W(25, 26), ankle: W(27, 28) } : { sh, hip, knee, ankle };
-  const tilt = world ? Math.max(torsoTilt(sh, hip), torsoTilt(g.sh, g.hip)) : torsoTilt(sh, hip);
+  const tilt2d = torsoTilt(sh, hip), tilt3d = world ? torsoTilt(g.sh, g.hip) : null;
+  const tilt = tilt3d === null ? tilt2d : Math.max(tilt2d, tilt3d);
   const scale = ref?.torso ?? torso2d; // standing torso length; the live one shrinks when bending toward the camera
   const metrics = {
     knee: kneeOk ? jointAngle(g.hip, g.knee, g.ankle) : null,
     hip: knee.v >= KNEE_VIS ? jointAngle(g.sh, g.hip, g.knee) : null,
-    tilt,
+    tilt, tilt2d, tilt3d,
     headDrop: (nose.y - hip.y) / scale, // >0: head below hips (sajda)
     hipDrop: ref ? (hip.y - ref.hipY) / scale : null, // >0: hips lower than when standing
     vis: Math.min(sh.v, hip.v),
@@ -74,14 +75,16 @@ export function classify(lm, aspect = 1, { world, ref } = {}) {
   // With hidden knees and no standing reference yet we can't tell standing from sitting: don't guess.
   const straight = k !== null ? k >= 140 : hipDrop !== null && !sitting;
   let pose = "transition";
-  if (headDrop > 0.25 && tilt > 100 && (k === null || k < 130)) pose = "sajda";
+  // Shoulders well below hips = sajda from any side, even from behind where the face is hidden.
+  if (tilt > 110 && (k === null || k < 130)) pose = "sajda";
+  else if (headDrop > 0.25 && tilt > 100 && (k === null || k < 130)) pose = "sajda";
   else if (bent && headDrop > 0) pose = "sajda";
   else if (bent && tilt < 45) pose = "jalsa";
   // Qunoot (Ja'fari, 2nd rakat): standing with hands raised to face level. Brief raises are takbir —
   // the caller tells them apart by duration.
   else if (straight && tilt < 25 && wrist.v >= 0.5 && wrist.y < sh.y) pose = "qunoot";
   else if (straight && tilt < 25) pose = "qiyam";
-  else if ((k === null ? !sitting : k >= 130) && tilt >= 55 && tilt <= 115) pose = "ruku";
+  else if ((k === null ? !sitting : k >= 130) && tilt >= 55 && tilt <= 110) pose = "ruku";
 
   const flags = {};
   if (pose === "ruku") {
@@ -141,8 +144,11 @@ export function annotate(segments, { minSegmentMs = 400, tumaninahMs = 1000 } = 
 export const STEP_MIN_MS = 800;   // ruku/sajda shorter than this are passes through, not real positions
 export const SAJDA_GAP_MS = 1000; // a new sajda only counts after at least this long out of sajda
 
-export function guideStep(segments, totalRakats = 4, { minSegmentMs = 400 } = {}) {
-  let rakat = 1, rukuDone = false, sajdas = 0, step = null, lastSajdaEnd = -Infinity;
+// Turns raw segments into prayer steps. Flicker pieces of one position merge into one step, so each
+// step carries the total time, stillness and voice for that position.
+export function prayerSteps(segments, totalRakats = 4, { minSegmentMs = 400 } = {}) {
+  let rakat = 1, rukuDone = false, sajdas = 0, lastSajdaEnd = -Infinity;
+  const steps = [];
   for (const s of segments) {
     if (dur(s) < minSegmentMs || ["unknown", "nobody", "transition"].includes(s.pose)) continue;
     const lbl = label(s);
@@ -151,10 +157,13 @@ export function guideStep(segments, totalRakats = 4, { minSegmentMs = 400 } = {}
     if ((lbl === "ruku" || lbl === "sajda") && dur(s) < STEP_MIN_MS) continue;
     // After both sajdas, standing (or a ruku if the standing was missed) starts the next rakat.
     if ((lbl === "qiyam" || lbl === "qunoot" || lbl === "ruku") && sajdas >= 2) { rakat++; rukuDone = false; sajdas = 0; }
+    const rukuAgain = lbl === "ruku" && rukuDone && sajdas === 0;
     if (lbl === "ruku") { rukuDone = true; sajdas = 0; }
     // A flicker inside one sajda must not count twice; two sajdas have a sitting (>= SAJDA_GAP_MS) between.
+    let newSajda = false;
     if (lbl === "sajda") {
-      if (s.start - lastSajdaEnd >= SAJDA_GAP_MS) sajdas++;
+      newSajda = s.start - lastSajdaEnd >= SAJDA_GAP_MS;
+      if (newSajda) sajdas++;
       lastSajdaEnd = s.end;
     }
 
@@ -166,9 +175,81 @@ export function guideStep(segments, totalRakats = 4, { minSegmentMs = 400 } = {}
       else if (rakat === 2) key = "tashahhud";
       else key = "istiraha";
     }
-    step = { pose: lbl, key, rakat, seg: s };
+
+    // Merge into an earlier step of the same position in this rakat instead of starting a new one.
+    const last = steps[steps.length - 1];
+    let target = null;
+    if (last && last.key === key && last.rakat === rakat && !newSajda) target = last;
+    else if (rukuAgain) target = [...steps].reverse().find((x) => x.rakat === rakat && x.key === "ruku");
+    else if (lbl === "sajda" && !newSajda) target = [...steps].reverse().find((x) => x.rakat === rakat && x.key === "sajda");
+    if (target) target.segs.push(s);
+    else steps.push({ pose: lbl, key, rakat, segs: [s] });
+    if (rukuAgain && target) steps.splice(steps.indexOf(target) + 1); // flicker qawmah between ruku pieces
   }
-  return step;
+  return steps;
+}
+
+export function guideStep(segments, totalRakats = 4, opts = {}) {
+  const steps = prayerSteps(segments, totalRakats, opts);
+  const last = steps[steps.length - 1];
+  return last ? { pose: last.pose, key: last.key, rakat: last.rakat, seg: last.segs[last.segs.length - 1] } : null;
+}
+
+// ---- End-of-prayer feedback ----------------------------------------------------------------------
+// Practice targets, not fiqh rulings: a calm tasbih takes ~2 s; tuma'ninah = at least 1 s fully still.
+export const FEEDBACK = { holdMs: 2000, stillMs: 1000, voiceMs: 700, tashahhudMs: 5000 };
+const sum = (segs, f) => segs.reduce((a, s) => a + (f(s) || 0), 0);
+const sec = (ms) => (ms / 1000).toFixed(1) + " s";
+
+// level: "good" | "improve" | "unsure". `voice` = whether the mic was on (otherwise recitation isn't judged).
+export function prayerReport(segments, totalRakats = 4, { voice = false, minSegmentMs = 400 } = {}) {
+  const steps = prayerSteps(segments, totalRakats, { minSegmentMs });
+  const rakatsDone = steps.length ? Math.max(...steps.map((s) => s.rakat)) : 0;
+  const items = [];
+  const add = (rakat, level, text) => items.push({ rakat, level, text });
+
+  const judgeHold = (rakat, name, st) => {
+    const held = sum(st.segs, dur), still = sum(st.segs, (s) => s.stillMs);
+    if (held < FEEDBACK.holdMs) add(rakat, "improve", `${name} was short (${sec(held)}). Stay until the tasbih is finished calmly.`);
+    else if (still < FEEDBACK.stillMs) add(rakat, "improve", `${name}: you kept moving (still ${sec(still)}). Settle completely before reciting.`);
+    else add(rakat, "good", `${name} held ${sec(held)}, calm and still.`);
+    if (voice) {
+      const v = sum(st.segs, (s) => s.voiceMs);
+      if (v < FEEDBACK.voiceMs) add(rakat, "improve", `${name}: no recitation heard. Recite the tasbih aloud enough for the phone to hear.`);
+      else add(rakat, "good", `${name}: recitation heard (${sec(v)}).`);
+    }
+  };
+
+  for (let r = 1; r <= Math.max(rakatsDone, 1); r++) {
+    const rs = steps.filter((s) => s.rakat === r);
+    const ruku = rs.find((s) => s.key === "ruku");
+    const sajdas = rs.filter((s) => s.key === "sajda");
+    if (!ruku) add(r, "unsure", "Ruku not seen clearly.");
+    else {
+      judgeHold(r, "Ruku", ruku);
+      const frames = sum(ruku.segs, (s) => s.rukuFrames), flat = sum(ruku.segs, (s) => s.backFlat);
+      if (frames >= 10) {
+        const avgTilt = sum(ruku.segs, (s) => s.tiltSum) / frames;
+        if (flat / frames >= 0.6) add(r, "good", `Back level in ruku (about ${avgTilt.toFixed(0)}° bend).`);
+        else add(r, "improve", `Back not level in ruku (about ${avgTilt.toFixed(0)}° from upright; aim for 90°). Bend until your back is flat.`);
+      }
+      if (!rs.some((s) => s.key === "qawmah")) add(r, "unsure", "Didn't see you stand up straight after ruku (qawmah).");
+    }
+    if (sajdas.length === 0) add(r, "unsure", "Sajdas not seen clearly.");
+    else if (sajdas.length === 1) add(r, "unsure", "Only one sajda seen. Make sure you sit up fully between the two sajdas.");
+    sajdas.forEach((s, i) => judgeHold(r, `Sajda ${i + 1}`, s));
+    if (r === 2 && !rs.some((s) => s.key === "qunoot")) add(r, "improve", "Qunoot not seen before ruku (mustahab). Raise your hands to face level.");
+    const needTashahhud = r === 2 || r === totalRakats;
+    if (needTashahhud && r <= rakatsDone) {
+      const t = rs.find((s) => s.key === "tashahhud" || s.key === "tashahhudSalam");
+      if (!t) add(r, "unsure", "Tashahhud sitting not seen.");
+      else if (sum(t.segs, dur) < FEEDBACK.tashahhudMs) add(r, "improve", `Tashahhud was quick (${sec(sum(t.segs, dur))}). Take your time.`);
+      else add(r, "good", `Sat for tashahhud ${sec(sum(t.segs, dur))}.`);
+    }
+  }
+  if (rakatsDone !== totalRakats) add(null, "unsure", `Counted ${rakatsDone} of ${totalRakats} rakats.`);
+  else add(null, "good", `All ${totalRakats} rakats counted.`);
+  return { rakatsDone, totalRakats, items };
 }
 
 // ---- Framing check for setting up alone: is the whole body in the picture? ----------------------
@@ -177,7 +258,9 @@ export function framing(lm) {
   if (!lm) return "nobody";
   const v = (i) => lm[i].visibility ?? 1;
   const inFrame = (i) => v(i) >= 0.5 && lm[i].x > 0.01 && lm[i].x < 0.99 && lm[i].y > 0.01 && lm[i].y < 0.99;
-  const headIn = inFrame(0);
+  // From behind the face is hidden: ears count, or shoulders well inside the top edge.
+  const headIn = inFrame(0) || inFrame(7) || inFrame(8) ||
+    ((v(11) >= 0.5 || v(12) >= 0.5) && Math.min(lm[11].y, lm[12].y) > 0.12);
   const feetIn = inFrame(27) || inFrame(28);
   if (!headIn && !feetIn) return "farther";
   if (!headIn) return "head";

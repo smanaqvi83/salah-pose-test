@@ -129,9 +129,11 @@ console.log("ok — practice guide steps");
 // Framing hints for setting the phone up alone.
 import { framing } from "./classify.js";
 const frame = (noseY, ankleY, x = 0.5) => {
-  const lm = Array.from({ length: 33 }, () => ({ x, y: 0.5, visibility: 0.9 }));
+  const lm = Array.from({ length: 33 }, () => ({ x, y: 0.5, visibility: 0.1 }));
+  lm[23] = lm[24] = { x, y: (noseY + ankleY) / 2, visibility: 0.9 };
   lm[0] = { x, y: noseY, visibility: noseY < 0 ? 0.1 : 0.9 };
   lm[27] = lm[28] = { x, y: ankleY, visibility: ankleY > 1 ? 0.1 : 0.9 };
+  lm[11] = lm[12] = { x, y: noseY + 0.1, visibility: 0.9 }; // shoulders just below the head
   return lm;
 };
 assert.equal(framing(undefined), "nobody");
@@ -157,3 +159,47 @@ assert.equal(guideStep(flicker.slice(0, 12), 2).rakat, 1);
 assert.equal(guideStep(flicker, 2).rakat, 2);
 assert.equal(guideStep(flicker, 2).key, "qiyam");
 console.log("ok — rakat count survives flicker");
+
+// End-of-prayer report on a 2-rakat practice: rakat 1 is good; rakat 2 has a rushed silent sajda and no qunoot.
+import { prayerReport } from "./classify.js";
+t = 0;
+const good = (pose, ms, extra = {}) => seg(pose, ms, { stillMs: ms, voiceMs: ms * 0.6, ...extra });
+const rukuQ = { rukuFrames: 30, backFlat: 28, tiltSum: 30 * 88 };
+const practice = [
+  good("qiyam", 5000), good("ruku", 3000, rukuQ), good("qiyam", 1500), good("sajda", 3000), good("jalsa", 1500),
+  good("sajda", 3000), good("jalsa", 1000),
+  good("qiyam", 5000), good("ruku", 900, rukuQ), seg("transition", 300), good("ruku", 2200, rukuQ), // flicker, one ruku
+  good("qiyam", 1500), good("sajda", 3000), good("jalsa", 1500),
+  seg("sajda", 1200, { stillMs: 200, voiceMs: 0 }), // rushed and silent
+  good("jalsa", 7000),
+];
+const rep = prayerReport(practice, 2, { voice: true });
+const texts = (lvl, r) => rep.items.filter((i) => i.level === lvl && (r === undefined || i.rakat === r)).map((i) => i.text).join(" | ");
+assert.equal(rep.rakatsDone, 2);
+assert.match(texts("good", null), /All 2 rakats/);
+assert.equal(texts("improve", 1), "", "rakat 1 should have nothing to improve: " + texts("improve", 1));
+assert.match(texts("improve", 2), /Sajda 2 was short/);
+assert.match(texts("improve", 2), /Sajda 2: no recitation heard/);
+assert.match(texts("improve", 2), /Qunoot not seen/);
+assert.match(texts("good", 2), /Ruku held 3\.1 s/, "flicker pieces of one ruku are merged");
+assert.match(texts("good", 2), /Sat for tashahhud 7\.0 s/);
+// Mic off: recitation isn't judged at all.
+assert.doesNotMatch(prayerReport(practice, 2).items.map((i) => i.text).join(), /recitation/);
+console.log("ok — end-of-prayer report");
+
+// Phone BEHIND the person (preferred: nobody bows toward the phone). Face hidden, so the nose is unreliable.
+const backView = (o) => { const lm = frontView(o); lm[0] = { ...lm[0], visibility: 0.05 }; return lm; };
+const standBack = backView({ noseY: 0.15, shY: 0.25, hipY: 0.5 });
+const bres = classify(standBack, 1, { world: world([0, -0.5, 0], [0, -0.65, 0]) });
+assert.equal(bres.pose, "qiyam");
+const bref = standingRef(undefined, standBack, 1, bres);
+// Ruku from behind: torso pitches AWAY from the camera (+z).
+assert.equal(classify(backView({ noseY: 0.42, shY: 0.4, hipY: 0.5 }), 1, { world: world([0, -0.05, 0.48], [0, 0.02, 0.62]), ref: bref }).pose, "ruku");
+// Sajda from behind: shoulders far below the raised hips; nose hidden and its estimate even sits above the hips.
+const sajdaBack = backView({ noseY: 0.55, shY: 0.8, hipY: 0.6, kneeVis: 0.2 });
+assert.equal(classify(sajdaBack, 1, { world: world([0, 0.3, 0.42], [0, 0.4, 0.6]), ref: bref }).pose, "sajda");
+// Sitting from behind.
+assert.equal(classify(backView({ noseY: 0.5, shY: 0.6, hipY: 0.85, kneeVis: 0.1 }), 1, { world: world([0, -0.5, 0], [0, -0.65, 0]), ref: bref }).pose, "jalsa");
+// Framing from behind: hidden face must not trigger "head cut off".
+assert.equal(framing(standBack), "ok");
+console.log("ok — phone behind: qiyam, ruku, sajda, jalsa, framing");
