@@ -142,3 +142,18 @@ assert.equal(framing(frame(-0.1, 1.2)), "farther");
 assert.equal(framing(frame(0.4, 0.7)), "closer");
 assert.equal(framing(frame(0.1, 0.9, 0.1)), "centre");
 console.log("ok — framing hints");
+
+// Real-world flicker: one ruku split into pieces, a ruku blip while going down, a sajda split in two.
+// Must still read as ONE rakat, then rakat 2 after standing up.
+t = 0;
+const flicker = [
+  seg("qiyam", 4000), seg("ruku", 900), seg("transition", 500), seg("ruku", 1500), seg("transition", 400), seg("ruku", 600),
+  seg("qiyam", 2000), seg("ruku", 500), seg("transition", 800), // blip on the way down
+  seg("sajda", 1500), seg("transition", 300), seg("sajda", 1200), // one sajda, flickering
+  seg("transition", 1500), // sitting between sajdas, not recognised
+  seg("sajda", 2500), seg("jalsa", 1200), seg("qiyam", 3000),
+];
+assert.equal(guideStep(flicker.slice(0, 12), 2).rakat, 1);
+assert.equal(guideStep(flicker, 2).rakat, 2);
+assert.equal(guideStep(flicker, 2).key, "qiyam");
+console.log("ok — rakat count survives flicker");

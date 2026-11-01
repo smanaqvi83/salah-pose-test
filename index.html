@@ -54,7 +54,7 @@
     <canvas id="overlay"></canvas>
     <div class="hud">
       <div><div id="pose">—</div><div id="still"></div></div>
-      <div id="rakat">Rakats: 0</div>
+      <div id="rakat">Rakat 1</div>
     </div>
   </div>
 
@@ -111,7 +111,7 @@
 </script>
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js?v=4";
+import { classify, standingRef, guideStep, framing, annotate as annotateSegments, label, dur } from "./classify.js?v=5";
 
 const MODELS = {
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -260,7 +260,8 @@ function update(pose, metrics, flags, now) {
   $("still").className = still ? "ok" : "warn";
   if (!ref) { $("still").textContent = setupMsg; $("still").className = "warn"; }
   renderGuide();
-  $("rakat").textContent = "Rakats: " + segments.filter((s) => s.pose === "ruku" && s.end - s.start >= MIN_SEGMENT_MS).length;
+  // Rakat comes from the prayer's structure (ruku, two sajdas, stand), not from counting ruku readings.
+  $("rakat").textContent = "Rakat " + (guideStep(segments, +$("prayer").value, { minSegmentMs: MIN_SEGMENT_MS })?.rakat ?? 1);
   if (metrics) {
     $("mKnee").textContent = metrics.knee === null ? "hidden" : metrics.knee.toFixed(0) + "°";
     $("mTilt").textContent = metrics.tilt.toFixed(0) + "°";

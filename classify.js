@@ -138,16 +138,25 @@ export function annotate(segments, { minSegmentMs = 400, tumaninahMs = 1000 } = 
 // whether a sitting is between the two sajdas, jalsat al-istiraha, or tashahhud.
 // ponytail: trusts detection; a missed sajda shifts the count until the next ruku. Upgrade path: let the
 // user tap "next" to correct, and use rakat-aware expectations in the MVP state machine.
+export const STEP_MIN_MS = 800;   // ruku/sajda shorter than this are passes through, not real positions
+export const SAJDA_GAP_MS = 1000; // a new sajda only counts after at least this long out of sajda
+
 export function guideStep(segments, totalRakats = 4, { minSegmentMs = 400 } = {}) {
-  let rakat = 1, rukuDone = false, sajdas = 0, step = null;
+  let rakat = 1, rukuDone = false, sajdas = 0, step = null, lastSajdaEnd = -Infinity;
   for (const s of segments) {
     if (dur(s) < minSegmentMs || ["unknown", "nobody", "transition"].includes(s.pose)) continue;
     const lbl = label(s);
     if (lbl === "takbir") continue;
-    if (lbl === "qiyam" && sajdas >= 2) { rakat++; rukuDone = false; sajdas = 0; }
+    // Bending down to sajda or rising from it passes through a ruku-like tilt for a moment: ignore blips.
+    if ((lbl === "ruku" || lbl === "sajda") && dur(s) < STEP_MIN_MS) continue;
+    // After both sajdas, standing (or a ruku if the standing was missed) starts the next rakat.
+    if ((lbl === "qiyam" || lbl === "qunoot" || lbl === "ruku") && sajdas >= 2) { rakat++; rukuDone = false; sajdas = 0; }
     if (lbl === "ruku") { rukuDone = true; sajdas = 0; }
-    // A new sajda segment only counts once; sajda -> jalsa -> sajda is two.
-    if (lbl === "sajda" && step?.pose !== "sajda") sajdas++;
+    // A flicker inside one sajda must not count twice; two sajdas have a sitting (>= SAJDA_GAP_MS) between.
+    if (lbl === "sajda") {
+      if (s.start - lastSajdaEnd >= SAJDA_GAP_MS) sajdas++;
+      lastSajdaEnd = s.end;
+    }
 
     let key = lbl;
     if (lbl === "qiyam") key = rukuDone ? "qawmah" : rakat <= 2 ? "qiyam" : "qiyamTasbihat";
